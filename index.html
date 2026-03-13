@@ -1613,7 +1613,7 @@
     <script type="module">
         import { initializeApp } from "https://www.gstatic.com/firebasejs/11.6.1/firebase-app.js";
         import { getAuth, signInAnonymously } from "https://www.gstatic.com/firebasejs/11.6.1/firebase-auth.js";
-        import { getDatabase, ref, set, onValue } from "https://www.gstatic.com/firebasejs/11.6.1/firebase-database.js";
+        import { getDatabase, ref, set, onValue, push } from "https://www.gstatic.com/firebasejs/11.6.1/firebase-database.js";
 
         // Updated Firebase Configuration for hrv2-5a910
         const firebaseConfig = {
@@ -1705,6 +1705,7 @@
         let currentScanLat = null;
         let currentScanLng = null;
         let currentScanType = 11; // 11 = Check-in, 12 = Check-out
+        let currentScanYard = null; // Dynamically identified Yard name
 
         window.startFaceScanCamera = async function(type = 11) {
             currentScanType = type;
@@ -1746,27 +1747,45 @@
             navigator.geolocation.getCurrentPosition(async (pos) => {
                 currentScanLat = pos.coords.latitude;
                 currentScanLng = pos.coords.longitude;
-                
-                // Allow if no GPS config for yard or radius is 0
-                let allowed = true;
-                if (locConfig && locConfig.gps && locConfig.gps.radius > 0) {
-                    const dist = haversineKm(currentScanLat, currentScanLng, locConfig.gps.lat, locConfig.gps.lng);
-                    if (dist > locConfig.gps.radius) {
-                        allowed = false;
-                        gpsStatus.innerHTML = `<span class="text-red-400">ห่างเกินไป (${dist.toFixed(2)} km / ${locConfig.gps.radius} km)</span>`;
-                        document.getElementById('fs-gps-alert').classList.remove('hidden');
-                    } else {
-                        gpsStatus.innerHTML = `<span class="text-emerald-500">GPS ยืนยันแล้ว (${dist.toFixed(2)} km)</span>`;
+                // 1. Dynamic GPS Checking
+                // Loop through all yards to see where the employee is checking in.
+                let matchedYardName = null;
+                let foundAnyYardWithRadius = false;
+                let allowed = false;
+
+                // First check if they are near ANY specific yard
+                for (let loc of appData.locations) {
+                    if (loc.gps && loc.gps.radius > 0) {
+                        foundAnyYardWithRadius = true;
+                        const dist = haversineKm(currentScanLat, currentScanLng, loc.gps.lat, loc.gps.lng);
+                        if (dist <= loc.gps.radius) {
+                            matchedYardName = typeof loc === 'object' ? loc.name : loc;
+                            allowed = true;
+                            gpsStatus.innerHTML = `<span class="text-emerald-500">พิกัดตรงกับไซต์: ${matchedYardName} (${dist.toFixed(2)} km)</span>`;
+                            break;
+                        }
                     }
-                } else {
-                    gpsStatus.innerHTML = `<span class="text-slate-400">พิกัด ${currentScanLat.toFixed(4)}, ${currentScanLng.toFixed(4)}</span>`;
                 }
 
                 if (!allowed) {
-                    mainStatus.innerHTML = '<span class="text-red-500">⛔ ไม่อนุญาตให้สแกน</span>';
+                    // They aren't in any strict yard. Fallback: Check if their default profile yard allows unlimited scanning
+                    if (locConfig && (!locConfig.gps || locConfig.gps.radius == 0)) {
+                        matchedYardName = emp.location;
+                        allowed = true;
+                        gpsStatus.innerHTML = `<span class="text-slate-400">พิกัดอิสระ (${currentScanLat.toFixed(4)}, ${currentScanLng.toFixed(4)})</span>`;
+                    }
+                }
+
+                if (!allowed) {
+                    // Determine if we need to show error message regarding default or nearest. We just show generic out of area.
+                    mainStatus.innerHTML = '<span class="text-red-500">⛔ ไม่อยู่ในบริเวณไซต์งานใดๆ</span>';
+                    gpsStatus.innerHTML = `<span class="text-red-400">พิกัดไม่อยู่ในพื้นที่ปฎิบัติงาน</span>`;
+                    document.getElementById('fs-gps-alert').classList.remove('hidden');
                     overlayStatus.innerText = 'Out of Area';
                     return;
                 }
+
+                currentScanYard = matchedYardName;
 
                 // 2. Load Models
                 mainStatus.innerHTML = '<i class="fas fa-spinner fa-spin text-blue-500"></i> โหลด AI Model...';
@@ -1830,26 +1849,38 @@
             const labeledDescriptors = knownFaces.map(kf => new faceapi.LabeledFaceDescriptors(kf.id.toString(), kf.descriptors));
             const faceMatcher = new faceapi.FaceMatcher(labeledDescriptors, MATCH_THRESHOLD);
 
-            faceScanInterval = setInterval(async () => {
-                if (video.paused || video.ended || !isFaceMode) return;
+            // CHANGED: Use recursive setTimeout instead of setInterval to prevent freezing
+            async function scanLoop() {
+                if (!isFaceMode || video.paused || video.ended) return;
 
-                const detection = await faceapi.detectSingleFace(video).withFaceLandmarks().withFaceDescriptor();
-                
-                if (detection) {
-                    const bestMatch = faceMatcher.findBestMatch(detection.descriptor);
-                    
-                    if (bestMatch.label !== 'unknown' && bestMatch.distance < MATCH_THRESHOLD) {
-                        clearInterval(faceScanInterval);
-                        scanLine.style.display = 'none';
-                        showConfirmFaceAttendance(parseInt(bestMatch.label), bestMatch.distance);
+                try {
+                    const detection = await faceapi.detectSingleFace(video).withFaceLandmarks().withFaceDescriptor();
+
+                    if (detection) {
+                        const bestMatch = faceMatcher.findBestMatch(detection.descriptor);
+
+                        if (bestMatch.label !== 'unknown' && bestMatch.distance < MATCH_THRESHOLD) {
+                            scanLine.style.display = 'none';
+                            showConfirmFaceAttendance(parseInt(bestMatch.label), bestMatch.distance);
+                            return; // Stop looping on success
+                        } else {
+                            overlay.innerText = `ไม่ตรงกัน (${bestMatch.distance.toFixed(2)})`;
+                            overlay.className = 'absolute top-3 left-1/2 -translate-x-1/2 bg-red-600/80 backdrop-blur-sm text-white px-4 py-1.5 rounded-full text-xs font-bold z-20 border border-white/20';
+                        }
                     } else {
-                        overlay.innerText = `ไม่ตรงกัน (${bestMatch.distance.toFixed(2)})`;
-                        overlay.className = 'absolute top-3 left-1/2 -translate-x-1/2 bg-red-600/80 backdrop-blur-sm text-white px-4 py-1.5 rounded-full text-xs font-bold z-20 border border-white/20';
+                        overlay.innerText = 'ไม่พบใบหน้า';
                     }
-                } else {
-                    overlay.innerText = 'ไม่พบใบหน้า';
+                } catch (error) {
+                    // Ignore errors, continue trying to scan
                 }
-            }, 500);
+
+                // If modal is still open, scan again
+                if (isFaceMode) {
+                    faceScanInterval = setTimeout(scanLoop, 300);
+                }
+            }
+
+            scanLoop(); // start the loop
         };
 
         window.showConfirmFaceAttendance = function(empId, distance) {
@@ -1876,38 +1907,58 @@
         window.confirmAttendanceFaceScan = function() {
             if (!currentMatchId) return;
 
+            // Change Save button to loading state
+            const btnConfirm = document.getElementById('ca-btn-confirm');
+            const originalBtnText = btnConfirm.innerHTML;
+            btnConfirm.innerHTML = '<i class="fas fa-spinner fa-spin"></i> กำลังบันทึก...';
+            btnConfirm.disabled = true;
+
             const now = new Date();
             const dateStr = now.toISOString().split('T')[0];
             
-            // Log attendance
-            appData.history.push({
+            // Build attendance record
+            const newRecord = {
                 id: Date.now(),
                 empId: currentMatchId,
                 date: dateStr,
                 type: currentScanType, // 11 (เข้างาน) or 12 (ออกงาน)
-                // Alternatively, determine late status based on location time vs now
                 timestamp: now.getTime(),
                 status: 'Approved',
                 lat: currentScanLat,
                 lng: currentScanLng,
+                yard: currentScanYard, // Record dynamic Yard assignment here
                 isFaceScan: true
-            });
-            
-            saveData();
-            
-            closeModal('confirmAttendanceModal');
-            closeFaceScanModal();
-            showToast('บันทึกเวลาสำเร็จ', 'success');
-            
-            // Reload View if user views their own
-            if (!isStaff && appData.currentUserId === currentMatchId) {
-                renderEmployeeView();
-            } else if (isStaff) {
-                renderAdminView();
-            }
-            // Send Line Notify if needed
-            const typeStr = currentScanType === 11 ? 'เข้างาน' : 'ออกงาน';
-            sendLineNotify(`👨 ${appData.employees.find(e => e.id===currentMatchId).name} สแกนใบหน้า${typeStr} เวลา ${now.getHours()}:${now.getMinutes()}`);
+            };
+
+            // Using push method specifically for history concurrency
+            appData.history.push(newRecord); // Local push for immediate UI response
+            push(ref(db, 'hrms_v6_data/history'), newRecord)
+                .then(() => {
+                    closeModal('confirmAttendanceModal');
+                    closeFaceScanModal();
+                    showToast('บันทึกเวลาสำเร็จ', 'success');
+                    
+                    // Reset Button State
+                    btnConfirm.innerHTML = originalBtnText;
+                    btnConfirm.disabled = false;
+                    
+                    // Reload View if user views their own
+                    if (!isStaff && appData.currentUserId === currentMatchId) {
+                        renderEmployeeView();
+                    } else if (isStaff) {
+                        renderAdminView();
+                    }
+                    
+                    // Send Line Notify if needed
+                    const typeStr = currentScanType === 11 ? 'เข้างาน' : 'ออกงาน';
+                    sendLineNotify(`👨 ${appData.employees.find(e => e.id===currentMatchId).name} สแกนใบหน้า${typeStr} ที่ ${currentScanYard || 'ไม่ระบุไซต์'} เวลา ${now.getHours()}:${now.getMinutes()}`);
+                })
+                .catch((e) => {
+                    showToast('เกิดข้อผิดพลาดในการบันทึกข้อมูล กรุณาลองใหม่', 'error');
+                    console.error("Firebase push error:", e);
+                    btnConfirm.innerHTML = originalBtnText;
+                    btnConfirm.disabled = false;
+                });
         };
 
         // ==========================================
@@ -2124,6 +2175,7 @@
             try {
                 await signInAnonymously(auth);
                 // Load data first, then check login status
+                let fbUpdateTimeout = null;
                 onValue(ref(db, 'hrms_v6_data'), (snapshot) => {
                     const data = snapshot.val();
                     if (data) {
@@ -2158,17 +2210,21 @@
 
                     document.getElementById('loadingOverlay').classList.add('opacity-0', 'pointer-events-none');
 
-                    // Check LocalStorage for Auto Login
-                    const storedAuth = localStorage.getItem('2ps_auth');
-                    if (storedAuth && !session.isLoggedIn) {
-                        const authData = JSON.parse(storedAuth);
-                        attemptLogin(authData.username, authData.password, true); // Silent login
-                    }
+                    // DEBOUNCE UI RE-RENDERING
+                    clearTimeout(fbUpdateTimeout);
+                    fbUpdateTimeout = setTimeout(() => {
+                        // Check LocalStorage for Auto Login
+                        const storedAuth = localStorage.getItem('2ps_auth');
+                        if (storedAuth && !session.isLoggedIn) {
+                            const authData = JSON.parse(storedAuth);
+                            attemptLogin(authData.username, authData.password, true); // Silent login
+                        }
 
-                    // If already logged in, just update UI
-                    if (session.isLoggedIn) {
-                        updateUI();
-                    }
+                        // If already logged in, just update UI
+                        if (session.isLoggedIn) {
+                            updateUI();
+                        }
+                    }, 1000);
                 });
             } catch (err) { console.error(err); }
 
@@ -2853,39 +2909,52 @@
             const currentMonth = selectedDateObj.getMonth();
             const currentYear = selectedDateObj.getFullYear();
 
-            const siteEmps = appData.employees.filter(e => e.location === appData.adminSelectedSite);
             const tbody = document.getElementById('adm-employee-list');
             tbody.innerHTML = '';
 
             let presentCount = 0;
             let absentCount = 0;
+            let siteEmps = [];
 
-            siteEmps.forEach(e => {
-                // Get Daily Record
+            // Evaluate each employee to see if they belong in this yard view today
+            appData.employees.forEach(e => {
+                // Get Daily Record for selected date
                 const dailyRecords = appData.history.filter(h => h.empId == e.id && h.date === selectedDate);
-                const status = dailyRecords[dailyRecords.length - 1];
+                const status = dailyRecords[dailyRecords.length - 1]; // Latest record of the day
 
-                // Calculate Monthly OT
-                let monthlyOT = 0;
-                appData.history.forEach(h => {
-                    if (h.empId == e.id && h.otHours) {
-                        const d = new Date(h.date);
-                        if (d.getMonth() === currentMonth && d.getFullYear() === currentYear) {
-                            monthlyOT += parseFloat(h.otHours);
-                        }
-                    }
-                });
-
-                // Count Stats
-                if (status) {
-                    const type = parseInt(status.type);
-                    if (type === 11 || type === 6 || type === 7) presentCount++;
-                    else absentCount++;
+                // Determine effective Yard for today
+                // If they checked in today, their effective yard is where they checked in.
+                // Otherwise, they belong to their default profile location.
+                let effectiveYard = e.location; 
+                if (status && status.yard) {
+                    effectiveYard = status.yard;
                 }
 
-                const otValue = (status && status.otHours) ? status.otHours : '';
+                // Only evaluate them if their effective yard matches the Admins filter
+                if (effectiveYard === appData.adminSelectedSite) {
+                    siteEmps.push(e);
 
-                // Determine button states
+                    // Calculate Monthly OT
+                    let monthlyOT = 0;
+                    appData.history.forEach(h => {
+                        if (h.empId == e.id && h.otHours) {
+                            const d = new Date(h.date);
+                            if (d.getMonth() === currentMonth && d.getFullYear() === currentYear) {
+                                monthlyOT += parseFloat(h.otHours);
+                            }
+                        }
+                    });
+
+                    // Count Stats
+                    if (status) {
+                        const type = parseInt(status.type);
+                        if (type === 11 || type === 6 || type === 7) presentCount++;
+                        else absentCount++;
+                    }
+
+                    const otValue = (status && status.otHours) ? status.otHours : '';
+
+                    // Determine button states
                 const isMa = status && status.type == 11;
                 const isSai = status && (status.type == 6 || status.type == 7);
                 const isKhad = status && status.type == 8;
@@ -2938,6 +3007,7 @@
                     </td>
                 `;
                 tbody.appendChild(row);
+                }
             });
 
             document.getElementById('adm-stats-total').innerText = siteEmps.length;
