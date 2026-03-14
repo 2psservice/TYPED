@@ -2036,6 +2036,11 @@
                     renderAdminView();
                 }
 
+                // FIX: Reset button state after a successful save
+                // so subsequent scans don't freeze on "กำลังบันทึก..."
+                btnConfirm.innerHTML = originalBtnText;
+                btnConfirm.disabled = false;
+
             })
                 .catch((e) => {
                     showToast('เกิดข้อผิดพลาดในการบันทึกข้อมูล กรุณาลองใหม่', 'error');
@@ -2195,6 +2200,9 @@
                 setTimeout(() => {
                     closeFaceRegisterModal();
                     showToast('บันทึกข้อมูลใบหน้าเรียบร้อยแล้ว', 'success');
+                    // FIX: Reset button state after a successful save
+                    document.getElementById('fr-btn-save').disabled = false;
+                    document.getElementById('fr-btn-text').innerText = 'บันทึกรูปที่';
                 }, 1500);
             }).catch(e => {
                 document.getElementById('fr-msg').innerHTML = `<span class="text-red-500">❌ ล้มเหลวขณะบันทึกเน็ตเวิร์ก</span>`;
@@ -2326,15 +2334,34 @@
         }
 
         async function saveData() {
-            // FIX: สร้างสำเนาข้อมูลและลบ currentUserId ออกก่อนบันทึก
-            // เพื่อไม่ให้สถานะหน้าจอของ Admin ไปกระทบพนักงานคนอื่นใน Database
-            const dataToSave = { ...appData };
-            delete dataToSave.currentUserId;
+            try {
+                // FIX: สร้างสำเนาข้อมูลและลบ currentUserId ออกก่อนบันทึก
+                // เพื่อไม่ให้สถานะหน้าจอของ Admin ไปกระทบพนักงานคนอื่นใน Database
+                const dataToSave = { ...appData };
+                delete dataToSave.currentUserId;
 
-            // Prevent Firebase FirebaseError: First argument contains undefined in property...
-            const sanitizedData = JSON.parse(JSON.stringify(dataToSave));
+                // FIX: Firebase & JSON.stringify do not support Float32Array from face-api.
+                // Convert all descriptors back to standard JS arrays before saving.
+                if (dataToSave.employees) {
+                    dataToSave.employees = dataToSave.employees.map(emp => {
+                        if (emp.faceDescriptors) {
+                            return {
+                                ...emp,
+                                faceDescriptors: emp.faceDescriptors.map(d => Array.from(d))
+                            };
+                        }
+                        return emp;
+                    });
+                }
 
-            await set(ref(db, 'hrms_v6_data'), sanitizedData);
+                // Prevent Firebase FirebaseError: First argument contains undefined in property...
+                const sanitizedData = JSON.parse(JSON.stringify(dataToSave));
+
+                await set(ref(db, 'hrms_v6_data'), sanitizedData);
+            } catch (err) {
+                console.error("Critical saveData Exception:", err);
+                throw err;
+            }
         }
 
         // --- LOGIN LOGIC ---
